@@ -9,16 +9,13 @@ Each check runs in a throwaway copy of the app. Database paths are fixed relativ
 to the code, so importing main from the repo would write test users into the
 real data/ directory.
 """
-import http.server
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_PATHS = ('main.py', 'src', 'web')
