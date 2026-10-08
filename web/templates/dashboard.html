@@ -320,6 +320,13 @@
             }
         }
 
+        // Escape stored crawl values before they go into HTML attributes or text
+        function escapeCrawlText(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
         async function loadCrawls() {
             try {
                 const response = await fetch('/api/crawls/list');
@@ -337,8 +344,8 @@
                         return `
                             <tr>
                                 <td>${started}</td>
-                                <td><a href="${crawl.base_url}" target="_blank" class="url-link">${crawl.base_url}</a></td>
-                                <td><span class="status-badge status-${crawl.status}">${crawl.status}</span></td>
+                                <td><a href="${escapeCrawlText(crawl.base_url)}" target="_blank" class="url-link">${escapeCrawlText(crawl.base_url)}</a></td>
+                                <td><span class="status-badge status-${escapeCrawlText(crawl.status)}">${escapeCrawlText(crawl.status)}</span></td>
                                 <td>${crawl.urls_crawled || 0}</td>
                                 <td>${duration}</td>
                                 <td class="actions">

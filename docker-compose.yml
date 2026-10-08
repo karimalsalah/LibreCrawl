@@ -22,15 +22,26 @@ services:
       # DANGEROUS: Set to "true" to allow login as any username with no password
       # (username only used to separate sessions). Do NOT use in production.
       - DANGEROUSLY_SKIP_AUTH=${DANGEROUSLY_SKIP_AUTH:-false}
-      # Uncomment these for SMTP sending
-      # - SMTP_HOST=${SMTP_HOST}
-      # - SMTP_PORT=${SMTP_PORT}
-      # - SMTP_USER=${SMTP_USER}
-      # - SMTP_PASSWORD=${SMTP_PASSWORD}
-      # - SMTP_FROM=${SMTP_FROM}
-      # - SMTP_FROM_NAME=${SMTP_FROM_NAME}
-      # Add this for correct links in the verification emails
-      # - MAIN_APP_URL=${MAIN_APP_URL}
+      # Set to "true" to turn off guest login
+      - DISABLE_GUEST=${DISABLE_GUEST:-false}
+      # Listen on all container interfaces. HOST_BINDING above decides who can reach the port.
+      - BIND_HOST=0.0.0.0
+      # Local mode may listen on those interfaces because the published port limits access
+      - LOCAL_MODE_ALLOW_LAN=true
+      # Set to "true" only behind a reverse proxy you control, so guest limits use the real client IP
+      - TRUST_PROXY=${TRUST_PROXY:-false}
+      # Session signing key. Without it sessions reset on every restart.
+      - SECRET_KEY=${SECRET_KEY:-}
+      # SMTP for verification emails (empty values fall back to the defaults in src/email_service.py)
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - SMTP_FROM_NAME=${SMTP_FROM_NAME:-}
+      # Base URLs for the links in verification emails and redirects
+      - MAIN_APP_URL=${MAIN_APP_URL:-}
+      - WORKSHOP_APP_URL=${WORKSHOP_APP_URL:-}
     restart: unless-stopped
     command: >
       sh -c "

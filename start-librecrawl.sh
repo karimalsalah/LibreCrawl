@@ -4,7 +4,7 @@
 
 mkdir -p data
 echo "Checking for Docker..."
-if command -v docker &> /dev/null && command -v docker compose &> /dev/null; then
+if command -v docker &> /dev/null && docker compose version > /dev/null 2>&1; then
     echo "Docker found! Starting LibreCrawl with Docker..."
     docker compose up -d
 

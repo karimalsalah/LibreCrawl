@@ -43,8 +43,8 @@ async function openDashboard() {
 
         crawls.forEach(crawl => {
             const date = new Date(crawl.started_at).toLocaleString();
-            const domain = crawl.base_domain || crawl.base_url;
-            const status = crawl.status || 'unknown';
+            const domain = escapeHtml(crawl.base_domain || crawl.base_url);
+            const status = escapeHtml(crawl.status || 'unknown');
             const statusColor = status === 'completed' ? '#10b981' : status === 'running' ? '#3b82f6' : status === 'paused' ? '#f59e0b' : '#6b7280';
 
             html += `

@@ -26,18 +26,19 @@ exit /b
 
 :nodocker
 echo Docker not found. Checking for Python...
-python --version 2>nul
+set PYTHON=python
+%PYTHON% --version 2>nul
 if errorlevel 1 goto trypy
 
 :foundpython
 echo Python found! Checking dependencies...
-pip show flask 2>nul
+%PYTHON% -m pip show flask 2>nul
 if errorlevel 1 goto installdeps
 
 :rundirect
 echo Starting LibreCrawl...
 start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:5000"
-python main.py -l
+%PYTHON% main.py -l
 exit /b
 
 :trypy
@@ -48,7 +49,7 @@ goto foundpython
 
 :installdeps
 echo Installing dependencies...
-pip install -r requirements.txt
+%PYTHON% -m pip install -r requirements.txt
 playwright install chromium
 goto rundirect
 

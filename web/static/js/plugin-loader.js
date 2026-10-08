@@ -1,6 +1,6 @@
 /**
  * LibreCrawl Plugin Loader
- * Automatically discovers and loads plugins from /static/plugins/
+ * Loads the plugins listed in discoverPlugins() from /static/plugins/
  */
 
 class PluginLoader {

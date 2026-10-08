@@ -1,7 +1,8 @@
 # LibreCrawl tests
 
-No test framework and no extra dependencies. Both files are plain scripts that
-run against the code already in this repo.
+No test framework. Each file is a plain script that runs against the code already in
+this repo. The Python scripts need `requirements.txt` installed; `tooltip_escape_test.js`
+needs Node.js and nothing else.
 
 ## fixture_tests.py
 
@@ -24,6 +25,33 @@ Each test pins a bug that reached production once:
 | `test_sitemap_discovery_is_async` | Sitemap probing blocks the start-crawl request, or the crawl finishes before discovery delivers its URLs |
 | `test_max_urls_counts_pages_not_images` | Image rows consume the max-URL budget, so an image-heavy site crawls only a page or two |
 | `test_event_ordering_under_polling` | The UI receives an update for a row it was never sent, or the same row twice |
+
+## regression_tests.py
+
+Checks for specific security and config fixes. Each check runs against a throwaway copy
+of the app, so the real `data/` directory is never touched.
+
+```bash
+python tests/regression_tests.py
+```
+
+| Check | What breaks if it fails |
+|---|---|
+| guest crawl ownership | A guest can read, load, resume, delete or archive another user's crawl by ID |
+| debug routes admin only | Any guest can see every active user's crawler instance and URLs |
+| proxy headers ignored by default | Guest crawl limits can be bypassed by sending an `X-Forwarded-For` header |
+| `.env` loaded before email settings | Verification links ignore `MAIN_APP_URL` and `SMTP_*` set in `.env` |
+| bind address and local-mode guard | The server listens on the LAN, where local mode gives every visitor admin |
+| robots.txt 5xx and unreachable | A broken robots.txt is treated as allow-all instead of RFC 9309's complete disallow |
+
+## tooltip_escape_test.js
+
+Loads the real `web/static/js/visualization.js` in Node with a stub DOM, fires the
+node tooltip, and checks that crawled titles and URLs reach it escaped.
+
+```bash
+node tests/tooltip_escape_test.js
+```
 
 ## crawl_harness.py
 

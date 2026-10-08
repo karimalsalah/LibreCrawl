@@ -128,11 +128,12 @@ function setupInteractions() {
 
         // Build tooltip content
         const statusClass = getStatusClass(data.status_code);
+        // Titles and URLs come from crawled pages, so escape them before innerHTML
         tooltip.innerHTML = `
-            <div class="tooltip-url">${truncateUrl(data.url)}</div>
+            <div class="tooltip-url">${escapeTooltipText(truncateUrl(data.url))}</div>
             <div class="tooltip-info">
-                <div><strong>Title:</strong> ${data.title || 'N/A'}</div>
-                <div class="tooltip-status ${statusClass}">Status: ${data.status_code}</div>
+                <div><strong>Title:</strong> ${escapeTooltipText(data.title || 'N/A')}</div>
+                <div class="tooltip-status ${statusClass}">Status: ${escapeTooltipText(data.status_code)}</div>
             </div>
         `;
 
@@ -391,6 +392,15 @@ function getStatusClass(statusCode) {
 function truncateUrl(url, maxLength = 60) {
     if (url.length <= maxLength) return url;
     return url.substring(0, maxLength - 3) + '...';
+}
+
+/**
+ * Helper: Escape text for HTML content (crawled titles and URLs are untrusted)
+ */
+function escapeTooltipText(value) {
+    const div = document.createElement('div');
+    div.textContent = value == null ? '' : String(value);
+    return div.innerHTML;
 }
 
 /**
