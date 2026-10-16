@@ -1,6 +1,6 @@
 # LibreCrawl Plugins
 
-Drop your custom plugin files here! Each `.js` file will automatically create a new tab in LibreCrawl.
+Drop your custom plugin files here! Each file creates a new tab in LibreCrawl once its filename is listed in `discoverPlugins()` in `web/static/js/plugin-loader.js`. The loader does not scan this folder.
 
 Looking for plugins, or want to share one? See the [Plugin Workshop](https://workshop.librecrawl.com).
 
@@ -8,7 +8,8 @@ Looking for plugins, or want to share one? See the [Plugin Workshop](https://wor
 
 1. Create a new `.js` file in this folder (e.g., `my-plugin.js`)
 2. Register your plugin using the LibreCrawl Plugin API
-3. Refresh the app - your new tab appears automatically!
+3. Add `'my-plugin.js'` to the `discoverPlugins()` list in `web/static/js/plugin-loader.js`
+4. Refresh the app - your new tab appears!
 
 ## 📝 Example Plugin Structure
 
@@ -121,6 +122,5 @@ Check out these example plugins to get started:
 
 - `_example-plugin.js` - Basic template (ignored by loader)
 - `e-e-a-t.js` - E-E-A-T analyzer example
-- `content-quality.js` - Content quality scorer example
 
 Happy plugin development! 🚀

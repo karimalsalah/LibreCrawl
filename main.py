@@ -14,14 +14,16 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_compress import Compress
 from functools import wraps
-from src.crawler import WebCrawler
-from src.settings_manager import SettingsManager
-from src.auth_db import init_db, create_user, authenticate_user, get_user_by_id, log_guest_crawl, get_guest_crawls_last_24h, verify_user, set_user_tier, create_verification_token, verify_token, get_user_by_email
-from src.email_service import send_verification_email, send_welcome_email
-
-# Load environment variables from .env file
+# Load environment variables from .env file before any src module is imported:
+# src/email_service.py reads SMTP_* and *_APP_URL at import time
 from dotenv import load_dotenv
 load_dotenv()
+
+from src.crawler import WebCrawler
+from src.settings_manager import SettingsManager
+from src.auth_db import init_db, create_user, authenticate_user, log_guest_crawl, get_guest_crawls_last_24h, create_verification_token, verify_token, get_user_by_email
+from src.crawl_db import caller_owns_crawl
+from src.email_service import send_verification_email, send_welcome_email
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -44,6 +46,13 @@ DISABLE_REGISTER = args.disable_register or os.getenv('REGISTRATION_DISABLED', '
 DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in ('true', '1', 'yes')
 DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 SKIP_AUTH = args.dangerously_skip_auth or os.getenv('DANGEROUSLY_SKIP_AUTH', '').lower() in ('true', '1', 'yes')
+# Proxy headers (CF-Connecting-IP, X-Forwarded-For) are only believed when a reverse proxy sits in front
+TRUST_PROXY = os.getenv('TRUST_PROXY', '').lower() in ('true', '1', 'yes')
+# Address the server listens on. Localhost by default; the Docker image sets 0.0.0.0.
+BIND_HOST = os.getenv('BIND_HOST', '').strip() or '127.0.0.1'
+LOOPBACK_BIND_HOSTS = ('127.0.0.1', 'localhost', '::1')
+# Lets local mode (admin for every visitor) listen beyond localhost, on purpose
+LOCAL_MODE_ALLOW_LAN = os.getenv('LOCAL_MODE_ALLOW_LAN', '').lower() in ('true', '1', 'yes')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
@@ -196,8 +205,11 @@ if SKIP_AUTH:
     print("=" * 60)
 
 def get_client_ip():
-    """Get the real client IP address, checking Cloudflare headers first"""
-    # Check Cloudflare header first
+    """Client IP for guest limits. Proxy headers are only read when TRUST_PROXY is set,
+    because any client can send them and choose the address it is counted under."""
+    if not TRUST_PROXY:
+        return request.remote_addr
+    # Behind a trusted reverse proxy: Cloudflare header first
     if 'CF-Connecting-IP' in request.headers:
         return request.headers['CF-Connecting-IP']
     # Check other common proxy headers
@@ -221,6 +233,17 @@ def login_required(f):
             if request.path.startswith('/api/'):
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
             return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    """Decorator for routes that expose other users' crawler state (admin tier only)"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get('tier') != 'admin':
+            if request.path.startswith('/api/'):
+                return jsonify({'success': False, 'error': 'Admin access required'}), 403
+            return 'Admin access required', 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -538,7 +561,7 @@ def verify_email():
     redirect_url = None
     if success:
         if app_source == 'workshop':
-            redirect_url = os.getenv('WORKSHOP_APP_URL', 'https://workshop.librecrawl.com')
+            redirect_url = os.getenv('WORKSHOP_APP_URL') or 'https://workshop.librecrawl.com'
         else:
             redirect_url = url_for('login_page')
 
@@ -705,6 +728,7 @@ def dashboard():
 
 @app.route('/debug/memory')
 @login_required
+@admin_required
 def debug_memory_page():
     """Debug page with nice UI for memory monitoring"""
     return render_template('debug_memory.html')
@@ -712,7 +736,7 @@ def debug_memory_page():
 @app.route('/api/start_crawl', methods=['POST'])
 @login_required
 def start_crawl():
-    from src.auth_db import get_crawls_last_24h, log_crawl_start
+    from src.auth_db import log_crawl_start
 
     data = request.get_json()
     url = data.get('url')
@@ -927,6 +951,7 @@ def visualization_data():
 
 @app.route('/api/debug/memory')
 @login_required
+@admin_required
 def debug_memory():
     """Debug endpoint showing memory stats for all active crawler instances"""
     with instances_lock:
@@ -951,6 +976,7 @@ def debug_memory():
 
 @app.route('/api/debug/memory/profile')
 @login_required
+@admin_required
 def debug_memory_profile():
     """Detailed memory profiling - what's actually using the RAM"""
     from src.core.memory_profiler import MemoryProfiler
@@ -1088,7 +1114,6 @@ def list_crawls():
 def get_crawl(crawl_id):
     """Get complete crawl data by ID"""
     try:
-        user_id = session.get('user_id')
         from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
 
         # Get crawl metadata
@@ -1096,8 +1121,8 @@ def get_crawl(crawl_id):
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        # Check ownership (guests have user_id = None)
-        if user_id and crawl.get('user_id') != user_id:
+        # Check ownership (guest crawls have user_id = None and belong to the guest session)
+        if not caller_owns_crawl(crawl, session.get('user_id'), session.get('session_id')):
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         # Load all data
@@ -1122,7 +1147,6 @@ def get_crawl(crawl_id):
 def load_crawl_into_session(crawl_id):
     """Load a historical crawl into the current session"""
     try:
-        user_id = session.get('user_id')
         from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
 
         # Get crawl metadata
@@ -1131,7 +1155,7 @@ def load_crawl_into_session(crawl_id):
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
         # Check ownership
-        if user_id and crawl.get('user_id') != user_id:
+        if not caller_owns_crawl(crawl, session.get('user_id'), session.get('session_id')):
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         # Get current crawler instance
@@ -1197,7 +1221,6 @@ def resume_crawl_endpoint(crawl_id):
 def delete_crawl_endpoint(crawl_id):
     """Delete a crawl and all associated data"""
     try:
-        user_id = session.get('user_id')
         from src.crawl_db import delete_crawl, get_crawl_by_id
 
         # Verify ownership
@@ -1205,7 +1228,7 @@ def delete_crawl_endpoint(crawl_id):
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        if user_id and crawl.get('user_id') != user_id:
+        if not caller_owns_crawl(crawl, session.get('user_id'), session.get('session_id')):
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         success = delete_crawl(crawl_id)
@@ -1218,7 +1241,6 @@ def delete_crawl_endpoint(crawl_id):
 def archive_crawl(crawl_id):
     """Archive crawl (mark as archived but keep data)"""
     try:
-        user_id = session.get('user_id')
         from src.crawl_db import set_crawl_status, get_crawl_by_id
 
         # Verify ownership
@@ -1226,7 +1248,7 @@ def archive_crawl(crawl_id):
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        if user_id and crawl.get('user_id') != user_id:
+        if not caller_owns_crawl(crawl, session.get('user_id'), session.get('session_id')):
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
         success = set_crawl_status(crawl_id, 'archived')
@@ -1698,7 +1720,7 @@ def recover_crashed_crawls():
             for crawl in crashed:
                 set_crawl_status(crawl['id'], 'failed')
                 print(f"Found crashed crawl: {crawl['base_url']} (ID: {crawl['id']})")
-                print(f"  → Marked as failed. User can resume from dashboard.")
+                print("  → Marked as failed. User can resume from dashboard.")
             print("=" * 60 + "\n")
     except Exception as e:
         print(f"Error during crash recovery: {e}")
@@ -1736,6 +1758,14 @@ def graceful_shutdown(signum, frame):
 def main():
     import signal
 
+    # Local mode makes every visitor an admin, so it must not listen beyond localhost
+    # unless the operator explicitly allows it
+    if LOCAL_MODE and BIND_HOST not in LOOPBACK_BIND_HOSTS and not LOCAL_MODE_ALLOW_LAN:
+        raise SystemExit(
+            f"Refusing to start: local mode gives every visitor admin access, but BIND_HOST is '{BIND_HOST}'. "
+            "Keep BIND_HOST=127.0.0.1, or set LOCAL_MODE_ALLOW_LAN=true to allow this on purpose."
+        )
+
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -1749,12 +1779,13 @@ def main():
     print("=" * 60)
     print("LibreCrawl - SEO Spider")
     print("=" * 60)
-    print(f"\n🚀 Server starting on http://0.0.0.0:5000")
-    print(f"🌐 Access from browser: http://localhost:5000")
-    print(f"📱 Access from network: http://<your-ip>:5000")
-    print(f"\n✨ Multi-tenancy enabled - each browser session is isolated")
-    print(f"💾 Settings stored in browser localStorage")
-    print(f"\nPress Ctrl+C to stop the server\n")
+    print(f"\n🚀 Server starting on http://{BIND_HOST}:5000")
+    print("🌐 Access from browser: http://localhost:5000")
+    if BIND_HOST not in LOOPBACK_BIND_HOSTS:
+        print("📱 Access from network: http://<your-ip>:5000")
+    print("\n✨ Multi-tenancy enabled - each browser session is isolated")
+    print("💾 Settings stored in browser localStorage")
+    print("\nPress Ctrl+C to stop the server\n")
     print("=" * 60 + "\n")
 
     # Open browser in a separate thread after short delay
@@ -1769,7 +1800,7 @@ def main():
     from waitress import serve
     print("Starting LibreCrawl on http://localhost:5000")
     print("Using Waitress WSGI server with multi-threading support")
-    serve(app, host='0.0.0.0', port=5000, threads=8)
+    serve(app, host=BIND_HOST, port=5000, threads=8)
 
 if __name__ == '__main__':
     main()

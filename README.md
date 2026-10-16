@@ -47,7 +47,7 @@ chmod +x start-librecrawl.sh
 
 **What it does automatically:**
 1. Checks for Docker - if found, runs LibreCrawl in a container (recommended)
-2. If no Docker, checks for Python - if not found, downloads and installs it (Windows only *temporairly disabled since it causes some bat issues*)
+2. If no Docker, checks for Python - if not found, prints install instructions and stops (it does not install Python for you)
 3. Installs all dependencies automatically (`pip install -r requirements.txt`)
 4. Installs Playwright browsers for JavaScript rendering
 5. Starts LibreCrawl in local mode (no authentication)
@@ -99,7 +99,7 @@ SECRET_KEY=replace-with-a-long-random-string
 
 #### Option 2: Python
 
-- Python 3.8 or later
+- Python 3.11 or later
 - Modern web browser (Chrome, Firefox, Safari, Edge)
 
 ### Installation
@@ -129,19 +129,20 @@ python main.py -l
 
 5. Open your browser and navigate to:
    - Local: `http://localhost:5000`
-   - Network: `http://<your-ip>:5000`
+   - Network: `http://<your-ip>:5000` (only with `BIND_HOST=0.0.0.0`; by default the Python server listens on localhost only)
 
 
 ## LibreCrawl Plugins
 
-Drop your custom plugin files in `/web/static/plugins/`! Each `.js` file will automatically create a new tab in LibreCrawl.
+Drop your custom plugin files in `/web/static/plugins/`! Each plugin file creates a new tab in LibreCrawl once its filename is listed in `discoverPlugins()` in `web/static/js/plugin-loader.js`. The loader does not scan the folder.
 
 
 ### 🔌 Quick Start
 
 1. Create a new `.js` file in this folder (e.g., `my-plugin.js`)
 2. Register your plugin using the LibreCrawl Plugin API
-3. Refresh the app - your new tab appears automatically!
+3. Add `'my-plugin.js'` to the `discoverPlugins()` list in `web/static/js/plugin-loader.js`
+4. Refresh the app - your new tab appears!
 
 ### 📝 Example Plugin Structure
 
@@ -261,7 +262,7 @@ Check out these example plugins to get started:
 **Standard Mode** (default):
 - Full authentication system with login/register
 - Tier-based access control (Guest, User, Extra, Admin)
-- Guest users limited to 3 crawls per 24 hours (IP-based)
+- Guest users limited to 3 crawls per 24 hours (IP-based; behind a reverse proxy set `TRUST_PROXY=true` so the real client IP is used)
 - Ideal for public-facing demos or shared hosting
 
 **Local Mode** (`--local` or `-l`):
@@ -269,6 +270,16 @@ Check out these example plugins to get started:
 - No rate limits or tier restrictions
 - Perfect for personal use or single-user self-hosting
 - Recommended for local development and testing
+
+### Environment variables
+
+Set these in `.env` (Docker and Python) or in the shell. `.env.example` lists every setting.
+
+- `DISABLE_GUEST=true` turns off guest login
+- `DEMO_MODE=true` sets a 1.5GB memory limit per user (same as `--demo`)
+- `BIND_HOST` sets the address the Python server listens on (default `127.0.0.1`)
+- `LOCAL_MODE_ALLOW_LAN=true` lets local mode listen beyond localhost; without it local mode refuses to start on a network address
+- `TRUST_PROXY=true` makes guest limits honour `CF-Connecting-IP` and `X-Forwarded-For`; enable it only behind a proxy you control
 
 ## Configuration
 

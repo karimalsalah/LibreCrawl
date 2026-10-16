@@ -5,8 +5,6 @@ Enables crash recovery and historical crawl access
 """
 import sqlite3
 import json
-import time
-from datetime import datetime
 from contextlib import contextmanager
 
 # Database file location (same as auth database) - stored in data/ for Docker volume persistence
@@ -467,6 +465,20 @@ def get_crawl_by_id(crawl_id):
     except Exception as e:
         print(f"Error fetching crawl: {e}")
         return None
+
+def caller_owns_crawl(crawl, user_id, session_id):
+    """Whether the caller may read or change a crawl record.
+
+    Registered-user crawls belong to that user_id. Guest crawls have user_id NULL and
+    belong only to the guest session that created them, matched on session_id.
+    Anything that cannot be matched to the caller is refused.
+    """
+    if not crawl:
+        return False
+    owner_user_id = crawl.get('user_id')
+    if owner_user_id is not None:
+        return user_id is not None and owner_user_id == user_id
+    return user_id is None and session_id is not None and crawl.get('session_id') == session_id
 
 def get_user_crawls(user_id, limit=50, offset=0, status_filter=None):
     """Get all crawls for a user"""

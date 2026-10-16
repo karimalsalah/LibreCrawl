@@ -5,7 +5,7 @@ Estate record: `docs/strategy/OSS-ADOPTION-2026-08-23.md` in `karimalsalah/stead
 
 ## What it is (verified live 2026-08-23)
 
-MIT · 873★ · last push 2026-08-18 · not archived · not a fork.
+MIT · 873★ · last push 2026-08-18 · not archived · upstream is not itself a fork.
 **Python** (`requirements.txt`), **999 KB** working tree. `src/` contains `core/`, `crawl_db.py`, `auth_db.py` — a **web crawler** with persistent storage and an auth layer.
 
 ## Why we took it
@@ -56,4 +56,4 @@ On 2026-08-23 the estate adopted a tool whose **five documented isolation flags 
 
 ## Upstream
 
-`upstream` = `PhialsBasement/LibreCrawl`. We track it; we do not push to it. Contributions go upstream as normal PRs under MIT.
+`upstream` = `PhialsBasement/LibreCrawl`. This checkout has no upstream remote yet (only `origin`), so add one with `git remote add upstream https://github.com/PhialsBasement/LibreCrawl.git` before tracking it. We do not push to upstream. Contributions go upstream as normal PRs under MIT.

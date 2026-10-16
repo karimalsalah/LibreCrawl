@@ -2,11 +2,12 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 urllib3==2.0.7
 flask==2.3.3
-flask-compress
-waitress
-playwright
+flask-compress==1.25
+waitress==3.0.2
+# playwright 1.63.0 needs the chromium_headless_shell-1243 browser: run "playwright install chromium"
+playwright==1.63.0
 nest-asyncio==1.5.8
-psutil
+psutil==7.2.2
 bcrypt==4.1.2
-markdown
-python-dotenv
+markdown==3.11
+python-dotenv==1.2.4

@@ -1,0 +1,8 @@
+# Secrets, local data and history must never be baked into the image
+.env
+**/.env
+.git
+data/
+**/*.db
+**/__pycache__
+ADOPTION.md

@@ -64,6 +64,11 @@ EXPOSE 5000
 # Set environment variables
 ENV FLASK_APP=main.py
 ENV PYTHONUNBUFFERED=1
+# The container listens on all of its interfaces; which host interfaces reach it is decided by
+# the published port (HOST_BINDING in docker-compose.yml), not by the app
+ENV BIND_HOST=0.0.0.0
+# Local mode may listen on those interfaces because the published port limits access
+ENV LOCAL_MODE_ALLOW_LAN=true
 
 # Run the application
 # The command is handled by docker-compose.yml

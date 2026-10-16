@@ -9,7 +9,7 @@ import threading
 import time
 import asyncio
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from urllib.robotparser import RobotFileParser
@@ -20,6 +20,8 @@ IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'avif', '
 
 # Parallel HEAD checks used for broken-image detection
 IMAGE_CHECK_WORKERS = 5
+# robots.txt that is unreachable or answers 5xx is treated as disallow-all for this long
+ROBOTS_UNAVAILABLE_RETRY_SECS = 300
 
 
 def classify_fetch_error(exc_or_msg):
@@ -151,6 +153,7 @@ class WebCrawler:
 
         # Robots.txt cache
         self._robots_cache = {}
+        self._robots_unavailable_at = {}  # robots_url -> monotonic time it was found unreachable
 
         # Image status cache (avoids re-checking the same image URL across pages)
         self._image_status_cache = {}
@@ -494,7 +497,7 @@ class WebCrawler:
             return False, "Crawl already in progress"
 
         try:
-            from src.crawl_db import get_resume_data, load_crawled_urls, set_crawl_status
+            from src.crawl_db import get_resume_data, load_crawled_urls, set_crawl_status, caller_owns_crawl
             from collections import deque
 
             # Load crawl data
@@ -506,8 +509,8 @@ class WebCrawler:
             if crawl_data['status'] not in ['paused', 'failed', 'running', 'stopped']:
                 return False, f"Cannot resume crawl with status: {crawl_data['status']}"
 
-            # Verify user owns this crawl (if not guest)
-            if user_id and crawl_data.get('user_id') != user_id:
+            # Verify the caller owns this crawl (guest crawls belong to the guest session)
+            if not caller_owns_crawl(crawl_data, user_id, session_id):
                 return False, "Unauthorized - you don't own this crawl"
 
             # Restore basic state
@@ -529,7 +532,7 @@ class WebCrawler:
             # Load already crawled URLs from database
             from src.crawl_db import load_crawl_links, load_crawl_issues
 
-            print(f"Loading crawled data from database...")
+            print("Loading crawled data from database...")
             self.crawl_results = load_crawled_urls(crawl_id)
 
             # Mark all crawled URLs as discovered to prevent re-discovery
@@ -1191,7 +1194,6 @@ class WebCrawler:
 
     async def _crawl_url_with_javascript(self, url, depth):
         """Crawl a single URL using JavaScript rendering"""
-        start_time = time.time()
 
         try:
             # Render page with JavaScript
@@ -1623,6 +1625,12 @@ class WebCrawler:
             parsed = urlparse(url)
             robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
 
+            # An unreachable robots.txt is only remembered for a short while, then fetched again
+            unavailable_at = self._robots_unavailable_at.get(robots_url)
+            if unavailable_at is not None and time.monotonic() - unavailable_at > ROBOTS_UNAVAILABLE_RETRY_SECS:
+                del self._robots_unavailable_at[robots_url]
+                self._robots_cache.pop(robots_url, None)
+
             if robots_url not in self._robots_cache:
                 rp = RobotFileParser()
                 rp.set_url(robots_url)
@@ -1634,13 +1642,20 @@ class WebCrawler:
                     response = self.session.get(robots_url, timeout=10)
                     if response.status_code in (401, 403):
                         rp.disallow_all = True
+                    elif response.status_code >= 500:
+                        # RFC 9309 section 2.3.1.4: a robots.txt that fails with a server
+                        # error is unreachable, which means complete disallow
+                        rp.disallow_all = True
+                        self._robots_unavailable_at[robots_url] = time.monotonic()
                     elif response.status_code >= 400:
                         rp.allow_all = True
                     else:
                         rp.parse(response.text.splitlines())
-                    self._robots_cache[robots_url] = rp
-                except:
-                    return True
+                except Exception:
+                    # Network failure: the robots.txt is unreachable, so disallow for now
+                    rp.disallow_all = True
+                    self._robots_unavailable_at[robots_url] = time.monotonic()
+                self._robots_cache[robots_url] = rp
 
             rp = self._robots_cache[robots_url]
             user_agent = self.config.get('user_agent', '*')
