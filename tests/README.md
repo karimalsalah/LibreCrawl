@@ -45,6 +45,7 @@ python tests/regression_tests.py
 | `.env` loaded before email settings | Verification links ignore `MAIN_APP_URL` and `SMTP_*` set in `.env` |
 | bind address and local-mode guard | The server listens on the LAN, where local mode gives every visitor admin |
 | robots.txt 5xx and unreachable | A broken robots.txt is treated as allow-all instead of RFC 9309's complete disallow |
+| password hashing over 72 bytes | Users whose password is longer than 72 bytes can no longer log in, or register with one, after the bcrypt 5 upgrade |
 
 ## tooltip_escape_test.js
 

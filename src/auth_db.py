@@ -120,15 +120,23 @@ def init_db():
     from src.crawl_db import init_crawl_tables
     init_crawl_tables()
 
+# bcrypt only uses the first 72 bytes of a password. bcrypt 4.x cut longer passwords to
+# 72 bytes silently; bcrypt 5 raises ValueError instead. Cutting them here keeps existing
+# hashes valid and long passwords working after the upgrade.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+def _bcrypt_password_bytes(password):
+    return password.encode('utf-8')[:BCRYPT_MAX_PASSWORD_BYTES]
+
 def hash_password(password):
     """Hash a password with bcrypt"""
     salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    hashed = bcrypt.hashpw(_bcrypt_password_bytes(password), salt)
     return hashed.decode('utf-8')
 
 def verify_password(password, password_hash):
     """Verify a password against its hash"""
-    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    return bcrypt.checkpw(_bcrypt_password_bytes(password), password_hash.encode('utf-8'))
 
 def create_user(username, email, password):
     """
