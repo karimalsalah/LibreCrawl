@@ -29,6 +29,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The fixture sites live on loopback, which the crawler refuses by default
+os.environ['ALLOW_PRIVATE_TARGETS'] = 'true'
+
 from src.crawler import WebCrawler  # noqa: E402
 
 # Fixture servers bind here upward. Override if these clash locally.

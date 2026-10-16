@@ -30,6 +30,8 @@ services:
       - LOCAL_MODE_ALLOW_LAN=true
       # Set to "true" only behind a reverse proxy you control, so guest limits use the real client IP
       - TRUST_PROXY=${TRUST_PROXY:-false}
+      # Set to "true" only to crawl sites on this machine or your LAN
+      - ALLOW_PRIVATE_TARGETS=${ALLOW_PRIVATE_TARGETS:-false}
       # Session signing key. Without it sessions reset on every restart.
       - SECRET_KEY=${SECRET_KEY:-}
       # SMTP for verification emails (empty values fall back to the defaults in src/email_service.py)

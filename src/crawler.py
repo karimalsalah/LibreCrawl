@@ -77,6 +77,7 @@ from src.core.seo_extractor import SEOExtractor
 from src.core.link_manager import LinkManager
 from src.core.js_renderer import JavaScriptRenderer
 from src.core.sitemap_parser import SitemapParser
+from src.core.target_guard import BlockedTarget, GuardedHTTPAdapter, blocked_reason
 from src.core.issue_detector import IssueDetector
 from src.core.memory_monitor import MemoryMonitor
 from src.core.memory_profiler import UserMemoryTracker
@@ -186,7 +187,7 @@ class WebCrawler:
         paying a fresh TCP and TLS handshake for the next request to that host.
         """
         size = max(10, int(concurrency) + HEAD_CHECK_WORKERS + 5)
-        adapter = requests.adapters.HTTPAdapter(
+        adapter = GuardedHTTPAdapter(
             pool_connections=size, pool_maxsize=size, max_retries=0)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
@@ -312,6 +313,10 @@ class WebCrawler:
             # Validate and normalize URL
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
+
+            reason = blocked_reason(url)
+            if reason:
+                return False, f"Refusing to crawl {url}: {reason}"
 
             parsed = urlparse(url)
             self.base_url = f"{parsed.scheme}://{parsed.netloc}"
@@ -1054,7 +1059,7 @@ class WebCrawler:
                     )
                     break
                 except Exception as e:
-                    if attempt >= retries:
+                    if attempt >= retries or isinstance(e, BlockedTarget):
                         raise e
                     time.sleep(1)
 

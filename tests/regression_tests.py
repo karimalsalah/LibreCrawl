@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for guest crawl ownership, admin-only debug routes, proxy
-headers, .env loading, bind address, robots.txt handling and password hashing.
+headers, .env loading, bind address, robots.txt handling, password hashing and
+the private-network crawl guard.
 
 Plain script, like fixture_tests.py:  python tests/regression_tests.py
 Prints PASS/FAIL per check and exits non-zero if any check fails.
@@ -23,6 +24,7 @@ CLEARED_ENV = (
     'LOCAL_MODE', 'DANGEROUSLY_SKIP_AUTH', 'REGISTRATION_DISABLED', 'DISABLE_GUEST', 'DEMO_MODE',
     'TRUST_PROXY', 'BIND_HOST', 'LOCAL_MODE_ALLOW_LAN', 'SECRET_KEY', 'SMTP_PORT', 'MAIN_APP_URL',
     'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy',
+    'ALLOW_PRIVATE_TARGETS',
 )
 
 
@@ -215,6 +217,68 @@ print(json.dumps(result))
 '''
 
 
+PRIVATE_TARGET_SNIPPET = r"""
+import json, http.server, threading
+import requests
+from src.core.target_guard import BlockedTarget, blocked_reason
+from src.crawler import WebCrawler
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"inside")
+    def log_message(self, *args):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+inside = "http://127.0.0.1:%d/" % server.server_address[1]
+
+result = {}
+for label, url in (
+    ("loopback", "http://127.0.0.1/"),
+    ("localhost", "http://localhost/"),
+    ("rfc1918", "http://10.0.0.5/"),
+    ("cloud metadata", "http://169.254.169.254/latest/meta-data/"),
+    ("ipv6 loopback", "http://[::1]/"),
+    ("ipv4-mapped ipv6", "http://[::ffff:127.0.0.1]/"),
+    ("unspecified", "http://0.0.0.0/"),
+    ("cgnat", "http://100.64.0.1/"),
+):
+    result[label + " blocked"] = blocked_reason(url) is not None
+result["public literal allowed"] = blocked_reason("http://1.1.1.1/") is None
+
+crawler = WebCrawler()
+try:
+    crawler.session.get(inside, timeout=5)
+    result["session refuses loopback"] = False
+except BlockedTarget:
+    result["session refuses loopback"] = True
+ok, message = crawler.start_crawl(inside)
+result["start_crawl refuses loopback"] = (not ok) and "ALLOW_PRIVATE_TARGETS" in message
+server.shutdown()
+print(json.dumps(result))
+"""
+
+PRIVATE_TARGET_OPT_IN_SNIPPET = r"""
+import json, http.server, threading
+from src.crawler import WebCrawler
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"inside")
+    def log_message(self, *args):
+        pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+inside = "http://127.0.0.1:%d/" % server.server_address[1]
+crawler = WebCrawler()
+body = crawler.session.get(inside, timeout=5).text
+server.shutdown()
+print(json.dumps({"opt-in reaches loopback": body == "inside"}))
+"""
+
+
 # Made with bcrypt 4.1.2 from a 100-byte password ("\u00e9" * 50). bcrypt 4.x cut it to 72 bytes.
 LEGACY_LONG_PASSWORD_HASH = '$2b$12$5jeYJOr058jJyCHXqvawbOPSfAuLtGLnngWVhcstRIA.viWl79oQ6'
 
@@ -286,7 +350,7 @@ def check_bind_address(failures):
 
 
 def check_robots_unavailable_disallows(failures):
-    got = run_json(ROBOTS_SNIPPET)
+    got = run_json(ROBOTS_SNIPPET, env={'ALLOW_PRIVATE_TARGETS': 'true'})
     expect('Disallow rule blocks /private', got['Disallow rule blocks /private'], False, failures)
     expect('Disallow rule allows /public', got['Disallow rule allows /public'], True, failures)
     expect('robots.txt 503 blocks /page', got['robots.txt 503 blocks /page'], False, failures)
@@ -302,6 +366,14 @@ def check_password_hashing(failures):
     expect('short wrong password rejected', got['short wrong password rejected'], False, failures)
 
 
+def check_private_targets_refused(failures):
+    got = run_json(PRIVATE_TARGET_SNIPPET)
+    for label, value in got.items():
+        expect(label, value, True, failures)
+    got = run_json(PRIVATE_TARGET_OPT_IN_SNIPPET, env={'ALLOW_PRIVATE_TARGETS': 'true'})
+    expect('ALLOW_PRIVATE_TARGETS=true reaches loopback', got['opt-in reaches loopback'], True, failures)
+
+
 CHECKS = (
     ('guest crawl ownership (LC-01)', check_guest_crawl_ownership),
     ('debug routes admin only (LC-05)', check_debug_routes_admin_only),
@@ -310,6 +382,7 @@ CHECKS = (
     ('bind address and local-mode guard (LC-02)', check_bind_address),
     ('robots.txt 5xx and unreachable disallow (LC-10)', check_robots_unavailable_disallows),
     ('password hashing over 72 bytes (bcrypt 5)', check_password_hashing),
+    ('private-network targets refused by default', check_private_targets_refused),
 )
 
 
