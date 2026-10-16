@@ -5,6 +5,18 @@ import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from urllib.parse import urlparse
 
+from src.core.target_guard import blocked_reason, private_targets_allowed
+
+
+
+async def _guard_route(route):
+    """Abort any browser request (page, redirect, subresource) to a non-public address."""
+    reason = await asyncio.get_running_loop().run_in_executor(
+        None, blocked_reason, route.request.url)
+    if reason:
+        await route.abort('blockedbyclient')
+    else:
+        await route.continue_()
 
 class JavaScriptRenderer:
     """Handles JavaScript rendering for dynamic content using Playwright"""
@@ -44,6 +56,8 @@ class JavaScriptRenderer:
                         'height': self.config.get('js_viewport_height', 1080)
                     }
                 )
+                if not private_targets_allowed():
+                    await context.route('**/*', _guard_route)
                 page = await context.new_page()
                 page.set_default_timeout(self.config.get('js_timeout', 30) * 1000)
                 self.page_pool.append(page)
@@ -137,6 +151,13 @@ class JavaScriptRenderer:
                 )
                 navigation_ms = (time.monotonic() - started) * 1000
                 response_ms = self._response_ms(response, navigation_ms)
+
+                # A redirect the browser followed on its own is not seen by the route
+                # guard, so refuse a page that landed on a non-public address
+                reason = await asyncio.get_running_loop().run_in_executor(
+                    None, blocked_reason, page.url)
+                if reason:
+                    return None, 0, f"Blocked target: {reason}", None, empty_timing
 
                 # Wait for JavaScript to render
                 await asyncio.sleep(self.config.get('js_wait_time', 3))

@@ -294,6 +294,7 @@ Set these in `.env` (Docker and Python) or in the shell. `.env.example` lists ev
 - `BIND_HOST` sets the address the Python server listens on (default `127.0.0.1`)
 - `LOCAL_MODE_ALLOW_LAN=true` lets local mode listen beyond localhost; without it local mode refuses to start on a network address
 - `TRUST_PROXY=true` makes guest limits honour `CF-Connecting-IP` and `X-Forwarded-For`; enable it only behind a proxy you control
+- `ALLOW_PRIVATE_TARGETS=true` lets crawls reach private, loopback and link-local addresses (your own machine, your LAN, cloud metadata endpoints). By default every request, including redirects and the JavaScript renderer's sub-requests, is refused when its host resolves to one of them
 
 ## Configuration
 
