@@ -14,7 +14,10 @@ DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 @contextmanager
 def get_db():
     """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
+    # Wait for a busy database instead of failing immediately: the crawler
+    # thread writes batches while request handlers read status and settings,
+    # and sqlite's default 5s was not enough during large end-of-crawl saves.
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row  # Return rows as dictionaries
     try:
         yield conn
@@ -121,6 +124,13 @@ def init_crawl_tables():
         # mistaken for a slow server
         try:
             cursor.execute('ALTER TABLE crawled_urls ADD COLUMN render_time REAL')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Migration: link_check_only, rows for external links that were only
+        # HEAD-checked (not crawled), which the Overview leaves out
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN link_check_only BOOLEAN DEFAULT 0')
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -301,7 +311,8 @@ def save_url_batch(crawl_id, urls):
                     url_data.get('response_time'),
                     url_data.get('javascript_rendered', False),
                     url_data.get('error_type'),
-                    url_data.get('render_time')
+                    url_data.get('render_time'),
+                    url_data.get('link_check_only', False)
                 )
                 rows.append(row)
 
@@ -313,8 +324,8 @@ def save_url_batch(crawl_id, urls):
                     meta_tags, og_tags, twitter_tags, json_ld, analytics, images,
                     hreflang, schema_org, redirects, linked_from,
                     external_links, internal_links, response_time, javascript_rendered,
-                    error_type, render_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_type, render_time, link_check_only
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(urls)} URLs to database for crawl {crawl_id}")

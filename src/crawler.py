@@ -18,8 +18,8 @@ import nest_asyncio
 # Extensions treated as images by the "Crawl Images" setting
 IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'avif', 'bmp'}
 
-# Parallel HEAD checks used for broken-image detection
-IMAGE_CHECK_WORKERS = 5
+# Parallel HEAD checks for images and (uncrawled) external links
+HEAD_CHECK_WORKERS = 5
 # robots.txt that is unreachable or answers 5xx is treated as disallow-all for this long
 ROBOTS_UNAVAILABLE_RETRY_SECS = 300
 
@@ -143,7 +143,7 @@ class WebCrawler:
         }
 
         # Pages actually fetched. stats['crawled'] also counts the rows
-        # synthesized from image HEAD checks, which are not fetches, so the
+        # synthesized from HEAD checks, which are not fetches, so the
         # max_urls budget is measured with this instead: otherwise one
         # image-heavy page can exhaust the whole limit on its own.
         self.pages_crawled = 0
@@ -155,10 +155,10 @@ class WebCrawler:
         self._robots_cache = {}
         self._robots_unavailable_at = {}  # robots_url -> monotonic time it was found unreachable
 
-        # Image status cache (avoids re-checking the same image URL across pages)
-        self._image_status_cache = {}
-        # Image URLs already given a synthesized result row from a HEAD check
-        self._synthesized_image_urls = set()
+        # HEAD status cache (avoids re-checking the same URL across pages)
+        self._head_status_cache = {}
+        # URLs already given a synthesized result row from a HEAD check
+        self._synthesized_urls = set()
 
         # Database persistence
         self.crawl_id = crawl_id
@@ -180,12 +180,12 @@ class WebCrawler:
         """Size the urllib3 connection pool to the work actually in flight.
 
         requests defaults to 10 connections per host, but two things draw from
-        the pool at once: the crawl workers, and the image HEAD checks which run
-        their own pool of IMAGE_CHECK_WORKERS threads. Exceeding the limit makes
+        the pool at once: the crawl workers, and the HEAD checks which run
+        their own pool of HEAD_CHECK_WORKERS threads. Exceeding the limit makes
         urllib3 discard established connections ("Connection pool is full"),
         paying a fresh TCP and TLS handshake for the next request to that host.
         """
-        size = max(10, int(concurrency) + IMAGE_CHECK_WORKERS + 5)
+        size = max(10, int(concurrency) + HEAD_CHECK_WORKERS + 5)
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=size, pool_maxsize=size, max_retries=0)
         self.session.mount('http://', adapter)
@@ -391,8 +391,8 @@ class WebCrawler:
         self.crawl_results.clear()
         self.pages_crawled = 0
         self.event_log.new_epoch()
-        self._image_status_cache.clear()
-        self._synthesized_image_urls.clear()
+        self._head_status_cache.clear()
+        self._synthesized_urls.clear()
         self.stats = {
             'discovered': 0,
             'crawled': 0,
@@ -1144,18 +1144,7 @@ class WebCrawler:
 
                 # Track + batch new links
                 if new_links:
-                    # HEAD-check image URLs for broken image detection
-                    image_links = [l for l in new_links if l.get('placement') == 'image']
-                    if image_links:
-                        self._check_image_statuses(image_links, depth + 1)
-                        broken = [l for l in image_links
-                                  if l.get('target_status') is not None
-                                  and (l['target_status'] >= 400 or l['target_status'] == 0)]
-                        if broken:
-                            result['broken_images'] = [
-                                {'url': l['target_url'], 'status': l['target_status']}
-                                for l in broken
-                            ]
+                    self._head_check_new_links(new_links, result, depth + 1)
 
                     # (link events were journalled by the link manager)
                     self.user_memory.track_links(new_links)
@@ -1282,18 +1271,7 @@ class WebCrawler:
 
             # Track + batch new links
             if new_links:
-                # HEAD-check image URLs for broken image detection
-                image_links = [l for l in new_links if l.get('placement') == 'image']
-                if image_links:
-                    self._check_image_statuses(image_links, depth + 1)
-                    broken = [l for l in image_links
-                              if l.get('target_status') is not None
-                              and (l['target_status'] >= 400 or l['target_status'] == 0)]
-                    if broken:
-                        result['broken_images'] = [
-                            {'url': l['target_url'], 'status': l['target_status']}
-                            for l in broken
-                        ]
+                self._head_check_new_links(new_links, result, depth + 1)
 
                 # (link events were journalled by the link manager)
                 self.user_memory.track_links(new_links)
@@ -1481,32 +1459,56 @@ class WebCrawler:
             self.event_log.emit_many('url_update', updated)
         print(f"Updated linked_from data for {len(updated)} URLs")
 
-    def _check_image_statuses(self, image_links, depth=0):
-        """HEAD-check image URLs to detect broken images.
+    def _head_check_new_links(self, new_links, result, depth):
+        """HEAD-check a page's new image links and uncrawled external links.
 
-        Uses a per-crawl cache so the same image URL is only checked once
-        even if it appears on many pages.  Runs up to 5 checks in parallel,
-        capped at 50 images per page to avoid blocking the crawl.
-
-        Images that won't be fetched as full crawl targets get a result row
-        synthesized from the HEAD response so they appear in the Images tab
-        without downloading the file.
+        Off-domain images are checked whatever crawl_external says: they are
+        assets of the page embedding them, and sites on Wix, Shopify,
+        Squarespace etc. serve every image from a CDN host. External links
+        are checked when crawl_external is off, so the External tab still
+        lists them (with status) without crawling the other site.
         """
-        check_external = self.config.get('crawl_external', False)
+        image_links = [l for l in new_links if l.get('placement') == 'image']
+        if image_links:
+            self._head_check_links(image_links, depth)
+            broken = [l for l in image_links
+                      if l.get('target_status') is not None
+                      and (l['target_status'] >= 400 or l['target_status'] == 0)]
+            if broken:
+                result['broken_images'] = [
+                    {'url': l['target_url'], 'status': l['target_status']}
+                    for l in broken
+                ]
 
+        if not self.config.get('crawl_external', False):
+            external_links = [l for l in new_links
+                              if l.get('placement') != 'image' and not l.get('is_internal')
+                              and urlparse(l['target_url']).scheme in ('http', 'https')]
+            if external_links:
+                self._head_check_links(external_links, depth, link_check_only=True)
+
+    def _head_check_links(self, links, depth=0, link_check_only=False):
+        """HEAD-check link targets that won't be fetched as crawl targets.
+
+        Uses a per-crawl cache so the same URL is only checked once even if
+        it appears on many pages.  Runs up to 5 checks in parallel, capped at
+        50 URLs per call to avoid blocking the crawl.
+
+        URLs that won't be fetched as full crawl targets get a result row
+        synthesized from the HEAD response so they appear in the Images /
+        External tabs without downloading the body. link_check_only marks
+        rows for links to sites that were not crawled, which the Overview
+        leaves out.
+        """
         # Statuses set here are journalled at the end: these links were already
         # announced by the link manager, so the UI only learns about a HEAD
         # result if we emit an update for it
         mutated = []
 
         to_check = []
-        for link in image_links:
+        for link in links:
             url = link['target_url']
-            # Respect the external-crawling setting: don't request (or mint
-            # result rows for) images hosted off-domain unless it's enabled
-            if not check_external and not self.link_manager.is_internal(url):
-                continue
-            cached = self._image_status_cache.get(url)
+            cached = self._head_status_cache.get(url)
             if cached is not None:
                 if link.get('target_status') != cached:
                     link['target_status'] = cached
@@ -1524,6 +1526,12 @@ class WebCrawler:
             size = 0
             try:
                 resp = self.session.head(url, timeout=5, allow_redirects=True)
+                # Plenty of servers refuse HEAD but serve GET; confirm with a
+                # streamed GET whose body is never read
+                if resp.status_code in (403, 405, 501):
+                    resp.close()
+                    resp = self.session.get(url, timeout=5, allow_redirects=True, stream=True)
+                    resp.close()
                 link['target_status'] = resp.status_code
                 content_type = resp.headers.get('content-type', '').split(';')[0]
                 try:
@@ -1532,14 +1540,15 @@ class WebCrawler:
                     size = 0
             except Exception:
                 link['target_status'] = 0
-            self._image_status_cache[url] = link['target_status']
+            self._head_status_cache[url] = link['target_status']
 
             # Skip synthesis for URLs that will be (or were) crawled for real
             if not self._should_crawl_url(url):
-                self._record_image_result(url, link['target_status'], content_type, size, depth)
+                self._record_head_result(url, link['target_status'], content_type, size, depth,
+                                         link_check_only)
 
         batch = to_check[:50]
-        with ThreadPoolExecutor(max_workers=min(IMAGE_CHECK_WORKERS, len(batch))) as pool:
+        with ThreadPoolExecutor(max_workers=min(HEAD_CHECK_WORKERS, len(batch))) as pool:
             pool.map(_head_check, batch)
 
         mutated.extend(batch)
@@ -1550,20 +1559,22 @@ class WebCrawler:
         if links:
             self.event_log.emit_many('link_update', links)
 
-    def _record_image_result(self, url, status_code, content_type, size, depth):
-        """Add a result row for an image from its HEAD response (no body download)"""
+    def _record_head_result(self, url, status_code, content_type, size, depth,
+                            link_check_only=False):
+        """Add a result row for a URL from its HEAD response (no body download)"""
         sources = self.link_manager.get_source_pages(url)
 
         with self.results_lock:
-            if url in self._synthesized_image_urls:
+            if url in self._synthesized_urls:
                 return
-            self._synthesized_image_urls.add(url)
+            self._synthesized_urls.add(url)
 
             result = self.seo_extractor.create_empty_result(url, depth, status_code)
             result['content_type'] = content_type
             result['size'] = size
             result['is_internal'] = self.link_manager.is_internal(url)
             result['linked_from'] = sources
+            result['link_check_only'] = link_check_only
             self.crawl_results.append(result)
             self.stats['crawled'] += 1
             # a result counts as discovered (issue #94)
