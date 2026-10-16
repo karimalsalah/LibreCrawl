@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regression checks for guest crawl ownership, admin-only debug routes, proxy
-headers, .env loading, bind address and robots.txt handling.
+headers, .env loading, bind address, robots.txt handling and password hashing.
 
 Plain script, like fixture_tests.py:  python tests/regression_tests.py
 Prints PASS/FAIL per check and exits non-zero if any check fails.
@@ -215,6 +215,25 @@ print(json.dumps(result))
 '''
 
 
+# Made with bcrypt 4.1.2 from a 100-byte password ("\u00e9" * 50). bcrypt 4.x cut it to 72 bytes.
+LEGACY_LONG_PASSWORD_HASH = '$2b$12$5jeYJOr058jJyCHXqvawbOPSfAuLtGLnngWVhcstRIA.viWl79oQ6'
+
+PASSWORD_SNIPPET = r'''
+import json
+from src import auth_db
+long_password = "\u00e9" * 50
+result = {}
+result["legacy hash verifies"] = auth_db.verify_password(long_password, %r)
+result["wrong password rejected"] = auth_db.verify_password("\u00e9" * 35 + "x", %r)
+fresh = auth_db.hash_password(long_password)
+result["new long-password hash verifies"] = auth_db.verify_password(long_password, fresh)
+short = auth_db.hash_password("correct horse")
+result["short password verifies"] = auth_db.verify_password("correct horse", short)
+result["short wrong password rejected"] = auth_db.verify_password("correct horsf", short)
+print(json.dumps(result))
+''' % (LEGACY_LONG_PASSWORD_HASH, LEGACY_LONG_PASSWORD_HASH)
+
+
 def expect(label, actual, expected, failures):
     if actual == expected:
         print(f'  PASS {label}: {actual!r}')
@@ -274,6 +293,15 @@ def check_robots_unavailable_disallows(failures):
     expect('robots.txt unreachable blocks /page', got['robots.txt unreachable blocks /page'], False, failures)
 
 
+def check_password_hashing(failures):
+    got = run_json(PASSWORD_SNIPPET)
+    expect('hash from bcrypt 4.x for a 100-byte password verifies', got['legacy hash verifies'], True, failures)
+    expect('wrong password rejected', got['wrong password rejected'], False, failures)
+    expect('new hash for a 100-byte password verifies', got['new long-password hash verifies'], True, failures)
+    expect('short password verifies', got['short password verifies'], True, failures)
+    expect('short wrong password rejected', got['short wrong password rejected'], False, failures)
+
+
 CHECKS = (
     ('guest crawl ownership (LC-01)', check_guest_crawl_ownership),
     ('debug routes admin only (LC-05)', check_debug_routes_admin_only),
@@ -281,6 +309,7 @@ CHECKS = (
     ('.env loaded before email settings (LC-07)', check_dotenv_loaded_before_email_settings),
     ('bind address and local-mode guard (LC-02)', check_bind_address),
     ('robots.txt 5xx and unreachable disallow (LC-10)', check_robots_unavailable_disallows),
+    ('password hashing over 72 bytes (bcrypt 5)', check_password_hashing),
 )
 
 

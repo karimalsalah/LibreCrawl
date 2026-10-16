@@ -57,3 +57,5 @@ On 2026-08-23 the estate adopted a tool whose **five documented isolation flags 
 ## Upstream
 
 `upstream` = `PhialsBasement/LibreCrawl`. This checkout has no upstream remote yet (only `origin`), so add one with `git remote add upstream https://github.com/PhialsBasement/LibreCrawl.git` before tracking it. We do not push to upstream. Contributions go upstream as normal PRs under MIT.
+
+2026-10-16: merged upstream `PhialsBasement/LibreCrawl` at `05a1372` (Zoho OAuth login, XLSX/XML exports, External tab) and upgraded the pinned dependencies (requests, urllib3, flask, bcrypt and others; pip-audit clean). Local tests and a boot smoke passed. The dry-run gate above has NOT been re-run for this bump and still needs running before any integration.

@@ -14,7 +14,7 @@ python tests/fixture_tests.py
 ```
 
 Prints a PASS/FAIL line per behaviour and exits non-zero if any fail. If ports
-8911-8917 are taken locally, set `FIXTURE_BASE_PORT` to move the range.
+8911-8920 are taken locally, set `FIXTURE_BASE_PORT` to move the range.
 
 Each test pins a bug that reached production once:
 
@@ -25,6 +25,8 @@ Each test pins a bug that reached production once:
 | `test_sitemap_discovery_is_async` | Sitemap probing blocks the start-crawl request, or the crawl finishes before discovery delivers its URLs |
 | `test_max_urls_counts_pages_not_images` | Image rows consume the max-URL budget, so an image-heavy site crawls only a page or two |
 | `test_event_ordering_under_polling` | The UI receives an update for a row it was never sent, or the same row twice |
+| `test_duplicate_detection_is_linear` | A site of templated pages holds the crawl in "finishing up" for minutes and produces two duplicate issues per matching pair (700k rows for 1,000 pages), locking the database while they save |
+| `test_export_formats_apply_to_every_data_type` | The format chosen in Settings is ignored for links/issues exports, or Excel silently produces CSV |
 
 ## regression_tests.py
 
@@ -43,6 +45,7 @@ python tests/regression_tests.py
 | `.env` loaded before email settings | Verification links ignore `MAIN_APP_URL` and `SMTP_*` set in `.env` |
 | bind address and local-mode guard | The server listens on the LAN, where local mode gives every visitor admin |
 | robots.txt 5xx and unreachable | A broken robots.txt is treated as allow-all instead of RFC 9309's complete disallow |
+| password hashing over 72 bytes | Users whose password is longer than 72 bytes can no longer log in, or register with one, after the bcrypt 5 upgrade |
 
 ## tooltip_escape_test.js
 

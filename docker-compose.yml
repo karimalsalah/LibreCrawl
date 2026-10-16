@@ -42,6 +42,16 @@ services:
       # Base URLs for the links in verification emails and redirects
       - MAIN_APP_URL=${MAIN_APP_URL:-}
       - WORKSHOP_APP_URL=${WORKSHOP_APP_URL:-}
+      # Zoho OAuth login (see .env.example for details)
+      - ZOHO_OAUTH_ENABLED=${ZOHO_OAUTH_ENABLED:-false}
+      - ZOHO_CLIENT_ID=${ZOHO_CLIENT_ID:-}
+      - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET:-}
+      - ZOHO_REDIRECT_URI=${ZOHO_REDIRECT_URI:-}
+      - ZOHO_ACCOUNTS_URL=${ZOHO_ACCOUNTS_URL:-}
+      - ZOHO_SCOPES=${ZOHO_SCOPES:-}
+      - ZOHO_ALLOWED_DOMAINS=${ZOHO_ALLOWED_DOMAINS:-}
+      - ZOHO_ALLOW_SIGNUP=${ZOHO_ALLOW_SIGNUP:-}
+      - ZOHO_DEFAULT_TIER=${ZOHO_DEFAULT_TIER:-}
     restart: unless-stopped
     command: >
       sh -c "

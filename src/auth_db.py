@@ -15,7 +15,8 @@ DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 @contextmanager
 def get_db():
     """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
+    # Wait for a busy database instead of failing immediately (see crawl_db).
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row  # Return rows as dictionaries
     try:
         yield conn
@@ -30,6 +31,10 @@ def init_db():
     """Initialize the database with users and settings tables"""
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     with get_db() as conn:
+        # Write-ahead logging lets status/settings reads proceed while the
+        # crawler thread is saving a batch, instead of "database is locked".
+        # Persistent: set once here, applies to every later connection.
+        conn.execute('PRAGMA journal_mode=WAL')
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -99,21 +104,39 @@ def init_db():
         except:
             pass  # Column already exists
 
+        # Zoho account ID, set for users who sign in with Zoho OAuth
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN zoho_id TEXT")
+        except:
+            pass  # Column already exists
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_zoho_id
+            ON users(zoho_id)
+        ''')
+
         print("Database initialized successfully")
 
     # Initialize crawl persistence tables
     from src.crawl_db import init_crawl_tables
     init_crawl_tables()
 
+# bcrypt only uses the first 72 bytes of a password. bcrypt 4.x cut longer passwords to
+# 72 bytes silently; bcrypt 5 raises ValueError instead. Cutting them here keeps existing
+# hashes valid and long passwords working after the upgrade.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+def _bcrypt_password_bytes(password):
+    return password.encode('utf-8')[:BCRYPT_MAX_PASSWORD_BYTES]
+
 def hash_password(password):
     """Hash a password with bcrypt"""
     salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    hashed = bcrypt.hashpw(_bcrypt_password_bytes(password), salt)
     return hashed.decode('utf-8')
 
 def verify_password(password, password_hash):
     """Verify a password against its hash"""
-    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    return bcrypt.checkpw(_bcrypt_password_bytes(password), password_hash.encode('utf-8'))
 
 def create_user(username, email, password):
     """
@@ -552,3 +575,62 @@ def get_user_by_email(email):
     except Exception as e:
         print(f"Error fetching user by email: {e}")
         return None
+
+def get_or_create_zoho_user(zoho_id, email, display_name, default_tier='user', allow_create=True):
+    """
+    Find the user for a Zoho account, linking or creating one as needed.
+
+    Lookup order: an account already linked to this Zoho ID, then an existing
+    account with the same (Zoho-verified) email, which gets linked. Otherwise a
+    new verified account is created when allow_create is set.
+    Returns (success, message, user_data)
+    """
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, username, email, tier FROM users WHERE zoho_id = ?', (zoho_id,))
+            user = cursor.fetchone()
+
+            if not user and email:
+                cursor.execute('SELECT id, username, email, tier FROM users WHERE email = ? COLLATE NOCASE', (email,))
+                user = cursor.fetchone()
+                if user:
+                    # Zoho has verified the email, so the account counts as verified
+                    cursor.execute('UPDATE users SET zoho_id = ?, verified = 1 WHERE id = ?', (zoho_id, user['id']))
+
+            if not user:
+                if not allow_create:
+                    return False, "No LibreCrawl account is linked to this Zoho account", None
+
+                # Build a unique username from the display name or email
+                base = (display_name or email.split('@')[0]).strip()
+                base = ''.join(c for c in base if c.isalnum() or c in '._-')[:40] or 'zoho_user'
+                if len(base) < 3:
+                    base = f'{base}_zoho'
+                username = base
+                suffix = 1
+                while cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,)).fetchone():
+                    suffix += 1
+                    username = f'{base}{suffix}'
+
+                # Nobody knows this password, so password login stays unusable
+                password_hash = hash_password(secrets.token_urlsafe(32))
+                cursor.execute('''
+                    INSERT INTO users (username, email, password_hash, verified, tier, zoho_id)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                ''', (username, email, password_hash, default_tier, zoho_id))
+                user = {'id': cursor.lastrowid, 'username': username, 'email': email, 'tier': default_tier}
+
+            cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user['id'],))
+
+            user_data = {
+                'id': user['id'],
+                'username': user['username'],
+                'email': user['email'],
+                'tier': user['tier'] or 'guest'
+            }
+            return True, "Login successful", user_data
+
+    except Exception as e:
+        print(f"Zoho login error: {e}")
+        return False, "An error occurred during Zoho login", None

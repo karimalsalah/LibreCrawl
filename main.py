@@ -9,7 +9,8 @@ import argparse
 import secrets
 import string
 import os
-from io import StringIO
+import base64
+from io import StringIO, BytesIO
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_compress import Compress
@@ -21,9 +22,10 @@ load_dotenv()
 
 from src.crawler import WebCrawler
 from src.settings_manager import SettingsManager
-from src.auth_db import init_db, create_user, authenticate_user, log_guest_crawl, get_guest_crawls_last_24h, create_verification_token, verify_token, get_user_by_email
+from src.auth_db import init_db, create_user, authenticate_user, log_guest_crawl, get_guest_crawls_last_24h, create_verification_token, verify_token, get_user_by_email, get_or_create_zoho_user
 from src.crawl_db import caller_owns_crawl
 from src.email_service import send_verification_email, send_welcome_email
+from src.zoho_oauth import ZohoOAuthConfig, ZohoOAuthError
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='LibreCrawl - SEO Spider Tool')
@@ -53,6 +55,7 @@ BIND_HOST = os.getenv('BIND_HOST', '').strip() or '127.0.0.1'
 LOOPBACK_BIND_HOSTS = ('127.0.0.1', 'localhost', '::1')
 # Lets local mode (admin for every visitor) listen beyond localhost, on purpose
 LOCAL_MODE_ALLOW_LAN = os.getenv('LOCAL_MODE_ALLOW_LAN', '').lower() in ('true', '1', 'yes')
+ZOHO = ZohoOAuthConfig(registration_disabled=DISABLE_REGISTER)
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
@@ -202,6 +205,15 @@ if SKIP_AUTH:
     print("Anyone can log in as any username with no password!")
     print("Username is used only to separate per-user sessions.")
     print("DO NOT use on a public network or production server!")
+    print("=" * 60)
+
+if ZOHO.enabled:
+    print("=" * 60)
+    print("ZOHO OAUTH LOGIN ENABLED")
+    print(f"Accounts server: {ZOHO.accounts_url}")
+    if ZOHO.allowed_domains:
+        print(f"Allowed email domains: {', '.join(ZOHO.allowed_domains)}")
+    print(f"New Zoho users: {'created with tier ' + repr(ZOHO.default_tier) if ZOHO.allow_signup else 'not allowed'}")
     print("=" * 60)
 
 def get_client_ip():
@@ -525,7 +537,60 @@ def login_page():
     # Redirect to app if already logged in
     if 'user_id' in session:
         return redirect(url_for('index'))
-    return render_template('login.html', registration_disabled=DISABLE_REGISTER, guest_disabled=DISABLE_GUEST, skip_auth=SKIP_AUTH)
+    return render_template('login.html', registration_disabled=DISABLE_REGISTER, guest_disabled=DISABLE_GUEST, skip_auth=SKIP_AUTH,
+                           zoho_enabled=ZOHO.enabled, login_error=session.pop('login_error', None))
+
+def _zoho_redirect_uri():
+    return ZOHO.redirect_uri or url_for('zoho_callback', _external=True)
+
+@app.route('/auth/zoho/login')
+def zoho_login():
+    if not ZOHO.enabled:
+        return redirect(url_for('login_page'))
+    state = secrets.token_urlsafe(32)
+    session['zoho_oauth_state'] = state
+    return redirect(ZOHO.authorize_url(_zoho_redirect_uri(), state))
+
+@app.route('/auth/zoho/callback')
+def zoho_callback():
+    if not ZOHO.enabled:
+        return redirect(url_for('login_page'))
+
+    def fail(message):
+        session['login_error'] = message
+        return redirect(url_for('login_page'))
+
+    expected_state = session.pop('zoho_oauth_state', None)
+    if request.args.get('error'):
+        return fail('Zoho login was cancelled or denied.')
+    if not expected_state or not secrets.compare_digest(expected_state, request.args.get('state', '')):
+        return fail('Zoho login expired or was invalid. Please try again.')
+    code = request.args.get('code')
+    if not code:
+        return fail('Zoho did not return an authorization code.')
+
+    try:
+        accounts_server = ZOHO.accounts_server_for(request.args.get('accounts-server'))
+        identity = ZOHO.fetch_identity(code, _zoho_redirect_uri(), accounts_server)
+    except ZohoOAuthError as e:
+        print(f"Zoho OAuth error: {e}")
+        return fail(str(e))
+
+    if not ZOHO.domain_allowed(identity['email']):
+        return fail('Your Zoho account\'s email domain is not allowed to log in here.')
+
+    success, message, user_data = get_or_create_zoho_user(
+        identity['zoho_id'], identity['email'], identity['name'],
+        default_tier=ZOHO.default_tier, allow_create=ZOHO.allow_signup)
+    if not success:
+        return fail(message)
+
+    session.clear()
+    session['user_id'] = user_data['id']
+    session['username'] = user_data['username']
+    session['tier'] = user_data['tier']
+    session.permanent = True
+    return redirect(url_for('index'))
 
 @app.route('/register')
 def register_page():
@@ -1323,6 +1388,18 @@ def export_stream():
                     mimetype='application/json',
                     headers={'Content-Disposition': f'attachment; filename=librecrawl_links_{timestamp}.json'}
                 )
+            elif export_format == 'xml':
+                return Response(
+                    _stream_links_xml(links),
+                    mimetype='application/xml',
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_links_{timestamp}.xml'}
+                )
+            elif export_format == 'xlsx':
+                return Response(
+                    _links_xlsx(links),
+                    mimetype=XLSX_MIMETYPE,
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_links_{timestamp}.xlsx'}
+                )
             else:
                 return Response(
                     _stream_links_csv(links),
@@ -1344,6 +1421,18 @@ def export_stream():
                     _stream_issues_json(issues),
                     mimetype='application/json',
                     headers={'Content-Disposition': f'attachment; filename=librecrawl_issues_{timestamp}.json'}
+                )
+            elif export_format == 'xml':
+                return Response(
+                    _stream_issues_xml(issues),
+                    mimetype='application/xml',
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_issues_{timestamp}.xml'}
+                )
+            elif export_format == 'xlsx':
+                return Response(
+                    _issues_xlsx(issues),
+                    mimetype=XLSX_MIMETYPE,
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_issues_{timestamp}.xlsx'}
                 )
             else:
                 return Response(
@@ -1374,6 +1463,12 @@ def export_stream():
                     _stream_urls_xml(urls, regular_fields),
                     mimetype='application/xml',
                     headers={'Content-Disposition': f'attachment; filename=librecrawl_export_{timestamp}.xml'}
+                )
+            elif export_format == 'xlsx':
+                return Response(
+                    _urls_xlsx(urls, regular_fields),
+                    mimetype=XLSX_MIMETYPE,
+                    headers={'Content-Disposition': f'attachment; filename=librecrawl_export_{timestamp}.xlsx'}
                 )
             else:
                 return Response(
@@ -1414,6 +1509,77 @@ def _format_csv_value(value, field):
     elif isinstance(value, (dict, list)):
         return str(value)
     return value
+
+
+XLSX_MIMETYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+_XLSX_CELL_LIMIT = 32767  # Excel's per-cell character limit
+
+
+def _xlsx_cell(value):
+    """Coerce an export value into something openpyxl will accept."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    text = ILLEGAL_CHARACTERS_RE.sub('', str(value))
+    return text[:_XLSX_CELL_LIMIT]
+
+
+def _build_xlsx(sheet_title, headers, rows):
+    """Build an .xlsx workbook in memory: one sheet, a header row, then `rows`
+    (iterables of cell values). Write-only mode streams rows to a temp file,
+    so memory stays flat for large crawls."""
+    from openpyxl import Workbook
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet(title=sheet_title)
+    sheet.append(list(headers))
+    for row in rows:
+        sheet.append([_xlsx_cell(v) for v in row])
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+LINK_EXPORT_FIELDS = ['source_url', 'target_url', 'anchor_text', 'is_internal', 'target_domain', 'target_status', 'placement']
+ISSUE_EXPORT_FIELDS = ['url', 'type', 'category', 'issue', 'details']
+
+
+def _link_export_row(link):
+    return {
+        'source_url': link.get('source_url', ''),
+        'target_url': link.get('target_url', ''),
+        'anchor_text': link.get('anchor_text', ''),
+        'is_internal': 'Yes' if link.get('is_internal') else 'No',
+        'target_domain': link.get('target_domain', ''),
+        'target_status': link['target_status'] if link.get('target_status') is not None else 'Not crawled',
+        'placement': link.get('placement', 'body')
+    }
+
+
+def _issue_export_row(issue):
+    return {
+        'url': issue.get('url', ''),
+        'type': issue.get('type', ''),
+        'category': issue.get('category', ''),
+        'issue': issue.get('issue', ''),
+        'details': str(issue.get('details', ''))
+    }
+
+
+def _urls_xlsx(urls, fields):
+    return _build_xlsx('URLs', fields,
+                       ([_format_csv_value(u.get(f, ''), f) for f in fields] for u in urls))
+
+
+def _links_xlsx(links):
+    return _build_xlsx('Links', LINK_EXPORT_FIELDS,
+                       ([_link_export_row(l)[f] for f in LINK_EXPORT_FIELDS] for l in links))
+
+
+def _issues_xlsx(issues):
+    return _build_xlsx('Issues', ISSUE_EXPORT_FIELDS,
+                       ([_issue_export_row(i)[f] for f in ISSUE_EXPORT_FIELDS] for i in issues))
 
 
 def _stream_urls_csv(urls, fields):
@@ -1464,26 +1630,43 @@ def _stream_urls_xml(urls, fields):
     yield '</librecrawl_export>\n'
 
 
+def _stream_records_xml(root_tag, list_tag, item_tag, total_attr, total, records, fields):
+    """Generator yielding an XML document of flat records, one element per field
+    (same shape as _stream_urls_xml)."""
+    yield '<?xml version="1.0" encoding="UTF-8"?>\n'
+    yield f'<{root_tag} export_date="{time.strftime("%Y-%m-%d %H:%M:%S")}" {total_attr}="{total}">\n'
+    yield f'  <{list_tag}>\n'
+    for record in records:
+        yield f'    <{item_tag}>\n'
+        for field in fields:
+            escaped = str(record.get(field, '')).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            yield f'      <{field}>{escaped}</{field}>\n'
+        yield f'    </{item_tag}>\n'
+    yield f'  </{list_tag}>\n'
+    yield f'</{root_tag}>\n'
+
+
+def _stream_links_xml(links):
+    return _stream_records_xml('librecrawl_links', 'links', 'link', 'total_links', len(links),
+                               (_link_export_row(link) for link in links), LINK_EXPORT_FIELDS)
+
+
+def _stream_issues_xml(issues):
+    return _stream_records_xml('librecrawl_issues', 'issues', 'issue', 'total_issues', len(issues),
+                               (_issue_export_row(issue) for issue in issues), ISSUE_EXPORT_FIELDS)
+
+
 def _stream_links_csv(links):
     """Generator that yields link CSV rows one at a time"""
-    fieldnames = ['source_url', 'target_url', 'anchor_text', 'is_internal', 'target_domain', 'target_status', 'placement']
     output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer = csv.DictWriter(output, fieldnames=LINK_EXPORT_FIELDS)
     writer.writeheader()
     yield output.getvalue()
     output.truncate(0)
     output.seek(0)
 
     for link in links:
-        writer.writerow({
-            'source_url': link.get('source_url', ''),
-            'target_url': link.get('target_url', ''),
-            'anchor_text': link.get('anchor_text', ''),
-            'is_internal': 'Yes' if link.get('is_internal') else 'No',
-            'target_domain': link.get('target_domain', ''),
-            'target_status': link['target_status'] if link.get('target_status') is not None else 'Not crawled',
-            'placement': link.get('placement', 'body')
-        })
+        writer.writerow(_link_export_row(link))
         yield output.getvalue()
         output.truncate(0)
         output.seek(0)
@@ -1511,22 +1694,15 @@ def _stream_links_json(links):
 
 def _stream_issues_csv(issues):
     """Generator that yields issue CSV rows one at a time"""
-    fieldnames = ['url', 'type', 'category', 'issue', 'details']
     output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer = csv.DictWriter(output, fieldnames=ISSUE_EXPORT_FIELDS)
     writer.writeheader()
     yield output.getvalue()
     output.truncate(0)
     output.seek(0)
 
     for issue in issues:
-        writer.writerow({
-            'url': issue.get('url', ''),
-            'type': issue.get('type', ''),
-            'category': issue.get('category', ''),
-            'issue': issue.get('issue', ''),
-            'details': str(issue.get('details', ''))
-        })
+        writer.writerow(_issue_export_row(issue))
         yield output.getvalue()
         output.truncate(0)
         output.seek(0)
@@ -1622,6 +1798,14 @@ def export_data():
                 issues_content = generate_issues_json_export(issues)
                 issues_mimetype = 'application/json'
                 issues_filename = f'librecrawl_issues_{int(time.time())}.json'
+            elif export_format == 'xml':
+                issues_content = ''.join(_stream_issues_xml(issues))
+                issues_mimetype = 'application/xml'
+                issues_filename = f'librecrawl_issues_{int(time.time())}.xml'
+            elif export_format == 'xlsx':
+                issues_content = base64.b64encode(_issues_xlsx(issues)).decode('ascii')
+                issues_mimetype = XLSX_MIMETYPE
+                issues_filename = f'librecrawl_issues_{int(time.time())}.xlsx'
             else:
                 issues_content = generate_issues_csv_export(issues)
                 issues_mimetype = 'text/csv'
@@ -1630,7 +1814,8 @@ def export_data():
             files_to_export.append({
                 'content': issues_content,
                 'mimetype': issues_mimetype,
-                'filename': issues_filename
+                'filename': issues_filename,
+                **({'encoding': 'base64'} if export_format == 'xlsx' else {})
             })
 
         # Generate links export if requested
@@ -1643,6 +1828,14 @@ def export_data():
                 links_content = generate_links_json_export(links)
                 links_mimetype = 'application/json'
                 links_filename = f'librecrawl_links_{int(time.time())}.json'
+            elif export_format == 'xml':
+                links_content = ''.join(_stream_links_xml(links))
+                links_mimetype = 'application/xml'
+                links_filename = f'librecrawl_links_{int(time.time())}.xml'
+            elif export_format == 'xlsx':
+                links_content = base64.b64encode(_links_xlsx(links)).decode('ascii')
+                links_mimetype = XLSX_MIMETYPE
+                links_filename = f'librecrawl_links_{int(time.time())}.xlsx'
             else:
                 links_content = generate_links_csv_export(links)
                 links_mimetype = 'text/csv'
@@ -1651,7 +1844,8 @@ def export_data():
             files_to_export.append({
                 'content': links_content,
                 'mimetype': links_mimetype,
-                'filename': links_filename
+                'filename': links_filename,
+                **({'encoding': 'base64'} if export_format == 'xlsx' else {})
             })
 
         # Generate regular export if there are regular fields
@@ -1668,13 +1862,18 @@ def export_data():
                 regular_content = generate_xml_export(urls, regular_fields)
                 regular_mimetype = 'application/xml'
                 regular_filename = f'librecrawl_export_{int(time.time())}.xml'
+            elif export_format == 'xlsx':
+                regular_content = base64.b64encode(_urls_xlsx(urls, regular_fields)).decode('ascii')
+                regular_mimetype = XLSX_MIMETYPE
+                regular_filename = f'librecrawl_export_{int(time.time())}.xlsx'
             else:
                 return jsonify({'success': False, 'error': 'Unsupported export format'})
 
             files_to_export.append({
                 'content': regular_content,
                 'mimetype': regular_mimetype,
-                'filename': regular_filename
+                'filename': regular_filename,
+                **({'encoding': 'base64'} if export_format == 'xlsx' else {})
             })
 
         # Handle special case where only special fields are selected but no data

@@ -11,8 +11,9 @@ means a real regression rather than a flaky expectation:
 
   1. relative links on a page reached through a cross-domain redirect resolve
      against the site that served the content, not the URL that was requested
-  2. images hosted off-domain are neither requested nor listed while
-     "crawl external links" is off
+  2. images hosted off-domain (CDNs) and external links are HEAD-checked and
+     listed even while "crawl external links" is off, without crawling
+     off-domain pages
   3. sitemap discovery does not block start_crawl, and a crawl does not
      finish while discovery is still feeding the queue
   4. max_urls budgets pages actually fetched, not the rows synthesized from
@@ -74,7 +75,7 @@ def make_handler(routes, hits=None, slow_paths=(), slow_seconds=0.0):
 
         def do_GET(self):
             if hits is not None:
-                hits.append(self.path)
+                hits.append(f'{self.command} {self.path}')
             if any(self.path.startswith(p) for p in slow_paths):
                 time.sleep(slow_seconds)
 
@@ -124,9 +125,10 @@ def test_cross_domain_redirect():
         '/local.html': html('<p>local page</p>'),
         '/go': (302, f'http://127.0.0.1:{site_b}/landing'),
     }), site_a)
+    b_hits = []
     b = serve(make_handler({
         '/landing': html('<a href="/issues">issues</a><a href="/pulls">pulls</a>'),
-    }), site_b)
+    }, hits=b_hits), site_b)
     try:
         crawler = crawl(f'http://127.0.0.1:{site_a}/')
         urls = {r['url'] for r in crawler.crawl_results}
@@ -143,36 +145,75 @@ def test_cross_domain_redirect():
 
         result('redirect: offsite links attributed to the other host',
                f'http://127.0.0.1:{site_b}/issues' in targets)
+        # (with crawl_external off, offsite links are HEAD-checked for the
+        # External tab, but never fetched)
         result('redirect: offsite content does not enter the queue',
-               f'http://127.0.0.1:{site_b}/issues' not in urls)
+               'GET /issues' not in b_hits, str(b_hits))
     finally:
         a.shutdown()
         b.shutdown()
 
 
 def test_external_images():
-    """crawl_external=off must also apply to image HEAD checks."""
+    """With crawl_external off, off-domain images (CDNs) and external links are
+    HEAD-checked and listed, but the external site is never crawled."""
     site, other = BASE_PORT + 2, BASE_PORT + 3
     other_hits = []
+    off = f'http://127.0.0.1:{other}'
     a = serve(make_handler({
-        '/': html(f'<img src="/in.png"><img src="http://127.0.0.1:{other}/out.png">'),
+        '/': html(f'<img src="/in.png"><img src="{off}/out.png">'
+                  f'<a href="{off}/page">offsite page</a>'
+                  f'<a href="{off}/gone">dead link</a>'
+                  f'<a href="{off}/no-head">HEAD refused</a>'
+                  f'<a href="javascript:void(0)">js</a>'),
         '/in.png': png(),
     }), site)
-    b = serve(make_handler({'/out.png': png()}, hits=other_hits), other)
+
+    class NoHead(make_handler({'/out.png': png(), '/page': html('<a href="/deeper">x</a>'),
+                               '/no-head': html('')}, hits=other_hits)):
+        def do_HEAD(self):
+            if self.path == '/no-head':
+                other_hits.append(f'HEAD {self.path}')
+                self._send(405)
+            else:
+                self.do_GET()
+
+    b = serve(NoHead, other)
     try:
         crawler = crawl(f'http://127.0.0.1:{site}/')
-        urls = {r['url'] for r in crawler.crawl_results}
-        result('images: offsite image not listed as a row',
-               f'http://127.0.0.1:{other}/out.png' not in urls)
-        result('images: offsite host never contacted', not other_hits, str(other_hits))
+        rows = {r['url']: r for r in crawler.crawl_results}
+        result('images: offsite image listed as a row', f'{off}/out.png' in rows)
+        result('images: offsite image HEAD-checked', 'HEAD /out.png' in other_hits, str(other_hits))
         result('images: same-domain image still listed',
-               f'http://127.0.0.1:{site}/in.png' in urls)
+               f'http://127.0.0.1:{site}/in.png' in rows)
+
+        ext = rows.get(f'{off}/page')
+        result('external: link listed as an external row',
+               ext is not None and ext['is_internal'] is False and ext['status_code'] == 200,
+               str(ext and (ext['is_internal'], ext['status_code'])))
+        result('external: link HEAD-checked, never fetched',
+               'HEAD /page' in other_hits and 'GET /page' not in other_hits
+               and not any('/deeper' in h for h in other_hits), str(other_hits))
+        result('external: dead link reports 404',
+               rows.get(f'{off}/gone', {}).get('status_code') == 404)
+        result('external: HEAD 405 falls back to GET',
+               rows.get(f'{off}/no-head', {}).get('status_code') == 200, str(other_hits))
+        link_statuses = {l['target_url']: l['target_status'] for l in crawler.link_manager.all_links}
+        result('external: link status shown in Links tab',
+               link_statuses.get(f'{off}/gone') == 404, str(link_statuses))
+        result('external: link rows flagged link_check_only (left out of Overview)',
+               ext is not None and ext.get('link_check_only') is True)
+        result('external: offsite image rows not flagged (stay in Overview)',
+               rows.get(f'{off}/out.png', {}).get('link_check_only') is False)
+        result('external: crawled pages not flagged',
+               not rows[f'http://127.0.0.1:{site}/'].get('link_check_only'))
+        result('external: non-http links ignored',
+               not any(u.startswith('javascript:') for u in rows))
 
         other_hits.clear()
         crawler = crawl(f'http://127.0.0.1:{site}/', crawl_external=True)
-        urls = {r['url'] for r in crawler.crawl_results}
-        result('images: offsite image checked when external crawling is on',
-               f'http://127.0.0.1:{other}/out.png' in urls and bool(other_hits))
+        result('external: crawled for real when crawl_external is on',
+               'GET /page' in other_hits and 'GET /deeper' in other_hits, str(other_hits))
     finally:
         a.shutdown()
         b.shutdown()
@@ -376,6 +417,190 @@ def test_js_response_time_excludes_render_wait():
         a.shutdown()
 
 
+def test_duplicate_detection_is_linear():
+    """A site of N near-identical pages (suburb "doorway" pages) used to hold
+    the crawl in "finishing up" for minutes and produce N² duplicate issues
+    (700k rows for 1,000 pages), locking SQLite while they were saved. It must
+    finish promptly with exactly one issue per page."""
+    from collections import Counter
+    from src.core.issue_detector import IssueDetector
+
+    site = BASE_PORT + 9
+    count = 60
+    routes = {'/': html(''.join(f'<a href="/area-{i}/">{i}</a>' for i in range(count)))}
+    for i in range(count):
+        routes[f'/area-{i}/'] = (
+            f'<html><head><title>Asbestos Removal Area{i} | Get a Free Quote Today!</title>'
+            f'<meta name="description" content="Proudly known as the best Asbestos Removal '
+            f'experts in Area{i}! Enjoy peace of mind."></head>'
+            f'<body><h1>Asbestos Removal Area{i}</h1><p>{"word " * 300}</p></body></html>')
+    a = serve(make_handler(routes), site)
+    try:
+        started = time.time()
+        crawler = crawl(f'http://127.0.0.1:{site}/', max_urls=count + 1,
+                        enable_duplication_check=True, duplication_threshold=0.85)
+        elapsed = time.time() - started
+        dupes = [i for i in crawler.issue_detector.get_issues()
+                 if i.get('issue') == 'Duplicate Content Detected']
+        per_url = Counter(i['url'] for i in dupes)
+        result('one duplicate issue per templated page',
+               len(dupes) == count and per_url and max(per_url.values()) == 1,
+               f'{len(dupes)} issues for {count} pages')
+        result('each issue counts the other templated pages',
+               bool(dupes) and all(f'{count - 1} similar pages' in i['details'] for i in dupes),
+               dupes[0]['details'][:100] if dupes else 'no issues')
+        result('the unrelated index page is not flagged',
+               f'http://127.0.0.1:{site}/' not in per_url)
+        result('crawl finished promptly', elapsed < 60, f'{elapsed:.1f}s')
+    finally:
+        a.shutdown()
+
+    # Scale check on the detector alone: 1,500 templated pages used to take
+    # ~10 minutes of pairwise SequenceMatcher calls.
+    pages = [{'url': f'https://x.au/p{i}/', 'status_code': 200, 'content_type': 'text/html',
+              'title': f'Asbestos Removal Area{i} | Get a Free Quote Today!',
+              'meta_description': f'Proudly known as the best Asbestos Removal experts in Area{i}!',
+              'h1': f'Asbestos Removal Area{i}', 'word_count': 1000 + i % 9} for i in range(1500)]
+    detector = IssueDetector()
+    started = time.time()
+    detector.detect_duplication_issues(pages, 0.85)
+    elapsed = time.time() - started
+    result('1,500 templated pages produce 1,500 issues quickly',
+           len(detector.get_issues()) == 1500 and elapsed < 30 and not detector.duplication_truncated,
+           f'{len(detector.get_issues())} issues in {elapsed:.1f}s')
+
+
+def test_export_formats_apply_to_every_data_type():
+    """The format picked in Settings must apply to URLs, links AND issues.
+    Links/issues used to fall back to CSV for XML, and "Excel (XLSX)" was
+    offered in the UI but never implemented, so it silently produced CSV."""
+    import base64
+    import json
+    import types
+    import xml.etree.ElementTree as ET
+    from io import BytesIO
+
+    os.environ.setdefault('LOCAL_MODE', 'true')
+    import main as app_module
+    from openpyxl import load_workbook
+    from src.core.issue_detector import IssueDetector
+
+    urls = [{'url': 'https://e.au/', 'status_code': 200, 'title': 'Home', 'h2': ['a', 'b']},
+            {'url': 'https://e.au/p', 'status_code': 404, 'title': 'Gone', 'h2': []}]
+    links = [{'source_url': 'https://e.au/', 'target_url': 'https://e.au/p', 'anchor_text': 'p',
+              'is_internal': True, 'target_domain': 'e.au', 'target_status': 404, 'placement': 'body'}]
+    issues = [{'url': 'https://e.au/p', 'type': 'error', 'category': 'HTTP', 'issue': 'Not Found',
+               'details': '404'}]
+    formats = (('csv', 'text/csv'), ('json', 'application/json'),
+               ('xml', 'application/xml'), ('xlsx', app_module.XLSX_MIMETYPE))
+
+    def parses(fmt, data, expect_rows):
+        if fmt == 'xlsx':
+            rows = list(load_workbook(BytesIO(data)).active.iter_rows(values_only=True))
+            return len(rows) == expect_rows + 1
+        if fmt == 'xml':
+            root = ET.fromstring(data)
+            return len(root[0]) == expect_rows
+        if fmt == 'json':
+            return len(json.loads(data)['data']) == expect_rows
+        return data.decode().count('\n') == expect_rows + 1
+
+    client = app_module.app.test_client()
+    with client.session_transaction() as s:
+        s['user_id'] = 1
+        s['username'] = 'fixture'
+        s['tier'] = 'admin'
+
+    # Streaming endpoint (active or loaded crawl): seed this session's crawler.
+    client.get('/api/crawl_status?stats_only=1')
+    with client.session_transaction() as s:
+        crawler = app_module.crawler_instances[s['session_id']]['crawler']
+    crawler.crawl_results = urls
+    crawler.issue_detector = IssueDetector()
+    crawler.issue_detector.detected_issues = list(issues)
+    crawler.link_manager = types.SimpleNamespace(all_links=[dict(l) for l in links])
+    for data_type, expect_rows in (('urls', 2), ('links', 1), ('issues', 1)):
+        for fmt, mimetype in formats:
+            resp = client.get(f'/api/export_stream?format={fmt}&type={data_type}&fields=url,title,h2')
+            disposition = resp.headers.get('Content-Disposition', '')
+            ok = (resp.status_code == 200 and resp.mimetype == mimetype
+                  and disposition.endswith('.' + fmt) and parses(fmt, resp.data, expect_rows))
+            result(f'streaming {data_type} export honours {fmt}', ok,
+                   f'{resp.status_code} {resp.mimetype} {disposition}')
+
+    # Legacy endpoint (crawl loaded from a file, data lives in the browser).
+    for fmt, mimetype in formats:
+        resp = client.post('/api/export_data', json={
+            'format': fmt, 'fields': ['url', 'title', 'links_detailed', 'issues_detected'],
+            'localData': {'urls': urls, 'links': links, 'issues': issues}})
+        body = resp.get_json() or {}
+        files = body.get('files') or []
+        ok = body.get('success') and len(files) == 3 and all(
+            f['mimetype'] == mimetype and f['filename'].endswith('.' + fmt) for f in files)
+        if ok and fmt == 'xlsx':
+            ok = all(f.get('encoding') == 'base64'
+                     and parses('xlsx', base64.b64decode(f['content']), 1 if 'export' not in f['filename'] else 2)
+                     for f in files)
+        result(f'legacy export honours {fmt} for every file', bool(ok),
+               ', '.join(f['filename'] for f in files) if files else str(body)[:120])
+
+
+def test_empty_alt_is_not_missing_alt():
+    """Issue #95: alt="" is correct for decorative images, not a defect."""
+    site = BASE_PORT + 11
+    page = html('<img src="/a.png" alt="A hand holding a crawler report">'
+                '<img src="/b.png" alt="">'
+                '<img src="/c.png">')
+    routes = {'/': page}
+    for name in ('a', 'b', 'c'):
+        routes[f'/{name}.png'] = png()
+
+    a = serve(make_handler(routes), site)
+    try:
+        crawler = crawl(f'http://127.0.0.1:{site}/')
+        root = next((r for r in crawler.crawl_results
+                     if r['url'].rstrip('/').endswith(str(site))), None)
+        if root is None:
+            root = next(r for r in crawler.crawl_results
+                        if (r.get('content_type') or '').startswith('text/html'))
+
+        images = {img['src'].rsplit('/', 1)[-1]: img for img in root.get('images', [])}
+        result('alt extraction keeps all three images',
+               len(images) == 3, str(sorted(images)))
+
+        result('described image records its alt',
+               images['a.png'].get('alt') == 'A hand holding a crawler report'
+               and images['a.png'].get('has_alt') is True)
+        result('decorative image is marked as having an alt',
+               images['b.png'].get('alt') == '' and images['b.png'].get('has_alt') is True)
+        result('image with no attribute is marked as missing',
+               images['c.png'].get('has_alt') is False)
+
+        from src.core.issue_detector import IssueDetector
+        detector = IssueDetector([])
+        detector.detect_issues(root)
+        alt_issues = [i for i in detector.detected_issues
+                      if i.get('issue') == 'Images Without Alt Text']
+
+        result('exactly one image is reported, not two',
+               len(alt_issues) == 1 and '1 of 3' in alt_issues[0]['details'],
+               alt_issues[0]['details'] if alt_issues else 'no issue raised')
+        result('the decorative image is called out as fine',
+               bool(alt_issues) and 'decorative' in alt_issues[0]['details'],
+               alt_issues[0]['details'] if alt_issues else '')
+
+        # a page where every image is correctly marked must raise nothing
+        clean = dict(root)
+        clean['images'] = [images['a.png'], images['b.png']]
+        detector.detected_issues = []
+        detector.detect_issues(clean)
+        result('correct markup raises no alt warning at all',
+               not [i for i in detector.detected_issues
+                    if i.get('issue') == 'Images Without Alt Text'])
+    finally:
+        a.shutdown()
+
+
 def _playwright_available():
     try:
         import playwright  # noqa: F401
@@ -392,6 +617,9 @@ TESTS = (
     test_event_ordering_under_polling,
     test_discovered_counts_image_rows,
     test_js_response_time_excludes_render_wait,
+    test_duplicate_detection_is_linear,
+    test_export_formats_apply_to_every_data_type,
+    test_empty_alt_is_not_missing_alt,
 )
 
 
